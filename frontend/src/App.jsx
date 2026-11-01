@@ -65,13 +65,13 @@ function PatientSidebar({ patients, selectedId, onSelect }) {
                   {patientName}
                 </p>
                 <p className="text-[10px] text-slate-500">
-                  {hours.toFixed(0)}h â€¢ Risk: {(riskScore * 100).toFixed(1)}%
+                  {hours.toFixed(0)}h {"\u2022"} Risk: {(riskScore * 100).toFixed(1)}%
                 </p>
               </div>
               <div
-                className={`status-badge text-[9px] px-1.5 py-0.5 status-${status.toLowerCase()}`}
+                className={`status-badge text-[9px] px-2 py-0.5 status-${status.toLowerCase()} whitespace-nowrap`}
               >
-                {status.charAt(0)}
+                {status}
               </div>
             </motion.button>
           );
