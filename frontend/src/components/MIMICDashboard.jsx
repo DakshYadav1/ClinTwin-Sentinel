@@ -1,4 +1,5 @@
-﻿import React from 'react';
+﻿import React, { useState, lazy, Suspense } from 'react';
+const HumanRiskModel3D = lazy(() => import('./HumanRiskModel3D'));
 
 function probability(value) {
   return `${(Number(value || 0) * 100).toFixed(1)}%`;
@@ -49,7 +50,11 @@ export default function MIMICDashboard({
   trajectory,
   loading,
 }) {
+  const [selectedRiskModel, setSelectedRiskModel] = useState('bilstm');
   const latest = patient?.latest_assessment;
+  const selectedRisk = selectedRiskModel === 'bilstm'
+    ? latest?.bilstm_probability
+    : latest?.transformer_probability;
   const assessments = trajectory?.trajectory || [];
 
   return (
@@ -150,6 +155,52 @@ export default function MIMICDashboard({
                 </p>
               </div>
 
+              <div className="glass-panel rounded-xl p-4 space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-200">
+                    Interactive Human Risk Model
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Select an independent model to visualize its predicted risk.
+                  </p>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setSelectedRiskModel('bilstm')}
+                    className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                      selectedRiskModel === 'bilstm'
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/50'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}
+                  >
+                    BiLSTM
+                  </button>
+
+                  <button
+                    onClick={() => setSelectedRiskModel('transformer')}
+                    className={`px-4 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                      selectedRiskModel === 'transformer'
+                        ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}
+                  >
+                    Transformer
+                  </button>
+                </div>
+
+                <Suspense fallback={
+                  <div className="h-[380px] flex items-center justify-center text-sm text-slate-400">
+                    Loading 3D visualization...
+                  </div>
+                }>
+                  <HumanRiskModel3D
+                    riskProbability={selectedRisk}
+                    modelName={selectedRiskModel === 'bilstm' ? 'BiLSTM' : 'Transformer'}
+                  />
+                </Suspense>
+              </div>
+
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <PredictionCard
                   title="BiLSTM"
@@ -231,3 +282,5 @@ export default function MIMICDashboard({
     </div>
   );
 }
+
+
