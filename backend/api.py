@@ -1,0 +1,1605 @@
+"""
+api.py — FastAPI Backend for ICU Digital Twin
+===============================================
+Phase B (real synthetic-data endpoints — see PHASE_B_REPORT.md):
+  GET  /api/roster                          — real canonical patient roster
+  GET  /api/patients/{stay_id}               — real current state (latest window)
+  GET  /api/patients/{stay_id}/predict        — real model prediction
+  GET  /api/patients/{stay_id}/explanation    — real gradient-attribution explanation
+  GET  /api/patients/{stay_id}/trajectory     — real per-window trajectory
+  GET  /api/patients/{stay_id}/twin-state     — real digital-twin state,
+                                                 split into OBSERVED /
+                                                 PREDICTED / SIMULATED
+                                                 (see digital_twin.py)
+
+  All of the above are backed by backend/inference_service.py — real
+  model inference on real synthetic test-split ICU stays. No endpoint
+  under /api/* fabricates a risk score, SHAP/gradient value, z_t, or
+  trajectory point.
+
+Pre-BioGears What-If / true ML counterfactual architecture (see
+backend/whatif.py and docs/BIOGEARS_INTEGRATION_BOUNDARY.md):
+  GET  /api/whatif/interventions              — real intervenable-feature
+                                                 vocabulary
+  POST /api/patients/{stay_id}/whatif          — validates a scenario
+                                                 against real patient data,
+                                                 returns: (1) the real
+                                                 baseline prediction, (2) a
+                                                 REAL ML counterfactual —
+                                                 the same trained model
+                                                 re-run on the modified
+                                                 input through the real
+                                                 feature-engineering
+                                                 pipeline (see
+                                                 InferenceService.
+                                                 compute_counterfactual) —
+                                                 and (3) an honest
+                                                 "physiological simulation
+                                                 not yet available"
+                                                 boundary. The ML
+                                                 counterfactual (2) is NOT
+                                                 the same thing as (3) — see
+                                                 backend/whatif.py's module
+                                                 docstring. Never fabricates
+                                                 a simulated outcome.
+
+Legacy endpoints (pre-Phase-B):
+  POST /predict       — real inference on client-supplied raw feature
+                         vectors (unchanged — still the only endpoint
+                         that accepts arbitrary patient_data directly)
+  GET  /patients       — REPLACED in Phase B: now returns the real
+                         roster (same data as /api/roster), not the old
+                         fabricated 10-patient list
+  GET  /patient/{id}   — REPLACED in Phase B: {id} is now interpreted as
+                         a real stay_id from the roster; returns real
+                         current state + explanation + trajectory
+  GET  /demo           — DEPRECATED, NOT REMOVED: still returns the old
+                         fully-fabricated dashboard payload (random
+                         vitals, invented feature-importance numbers,
+                         invented patients) for backward compatibility
+                         only. Response is stamped `"deprecated": true`.
+                         The production frontend must not call this
+                         endpoint — see PHASE_B_REPORT.md section on
+                         fake-endpoint cleanup.
+
+Field-naming note (Phase D — see PHASE_D_REPORT.md): every endpoint in
+this file, old and new, now uses `gradient_attribution`, never
+`shap_values` — the underlying computation everywhere is real
+input×gradient saliency (explainability.gradient_x_input_attribution),
+not a Shapley value. Real SHAP (shap.KernelExplainer) exists in
+explainability.compute_shap_values() but is not invoked by any live
+endpoint in this file; see that module's docstring for why and how the
+distinction is preserved if it's ever wired in.
+"""
+
+import os
+import sys
+import json
+import joblib
+import numpy as np
+import torch
+import logging
+from typing import Optional, List, Dict, Union
+from contextlib import asynccontextmanager
+from starlette.concurrency import run_in_threadpool
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
+from utils import setup_logging, set_seed
+
+# Initialize logging
+logger = setup_logging()
+
+# Lazy imports to avoid slow startup
+_model = None
+_feature_cols = None
+_scaler = None
+_demo_data = None
+# NOTE: there is deliberately no separate `_digital_twin` global anymore —
+# see _get_digital_twin()'s docstring below for why.
+
+
+def _load_model():
+    """Load trained model or create a demo model."""
+    global _model, _feature_cols, _scaler
+    
+    from backend.lstm_model import ICUBiLSTM
+    from backend.transformer_model import ICUTransformer
+    
+    # Try loading LSTM first, then Transformer. This order is deliberate,
+    # not incidental: BiLSTM is this project's primary/reported model —
+    # the Transformer is kept only as an optional ablation comparison
+    # (see backend/train.py's module docstring and config.py's Transformer
+    # section for why). Live inference should never silently serve a
+    # Transformer checkpoint just because an LSTM one happens to be
+    # missing without that being an explicit, visible choice.
+    for model_path, ModelClass, model_type in [
+        (config.LSTM_MODEL_PATH, ICUBiLSTM, "lstm"),
+        (config.TRANSFORMER_MODEL_PATH, ICUTransformer, "transformer"),
+    ]:
+        if os.path.exists(model_path):
+            logger.info(f"Loading trained {model_type} model from {model_path}")
+            checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
+            input_size = checkpoint["input_size"]
+            _feature_cols = checkpoint["feature_cols"]
+            state_dict = checkpoint["model_state_dict"]
+
+            if model_type == "lstm":
+                hidden_size = state_dict["input_proj.0.weight"].shape[0] if "input_proj.0.weight" in state_dict else config.LSTM_HIDDEN_SIZE
+                layer_indices = [
+                    int(k.split("_l")[1].split("_")[0])
+                    for k in state_dict.keys()
+                    if "lstm.weight_ih_l" in k
+                ]
+                num_layers = max(layer_indices) + 1 if layer_indices else config.LSTM_NUM_LAYERS
+                bidirectional = any("reverse" in k for k in state_dict.keys())
+                model = ICUBiLSTM(
+                    input_size=input_size,
+                    hidden_size=hidden_size,
+                    num_layers=num_layers,
+                    bidirectional=bidirectional,
+                )
+            else:
+                d_model = state_dict["embedding.0.weight"].shape[0] if "embedding.0.weight" in state_dict else config.TRANSFORMER_D_MODEL
+                layer_indices = [
+                    int(k.split("encoder_layers.")[1].split(".")[0])
+                    for k in state_dict.keys()
+                    if "encoder_layers." in k
+                ]
+                num_layers = max(layer_indices) + 1 if layer_indices else config.TRANSFORMER_NUM_LAYERS
+                dim_feedforward = state_dict["encoder_layers.0.linear1.weight"].shape[0] if "encoder_layers.0.linear1.weight" in state_dict else config.TRANSFORMER_DIM_FEEDFORWARD
+                model = ICUTransformer(
+                    input_size=input_size,
+                    d_model=d_model,
+                    num_layers=num_layers,
+                    dim_feedforward=dim_feedforward,
+                )
+
+            model.load_state_dict(state_dict)
+            model.eval()
+            _model = (model, model_type)
+
+            # Load the scaler fit during training (preprocessing.fit_scaler /
+            # scale_splits, saved to config.SCALER_PATH). POST /predict must
+            # standardize incoming raw vitals exactly the way the model was
+            # trained on (via preprocessing.prepare_inference_sequence) — see
+            # that function's docstring. Previously /predict skipped both
+            # scaling AND feature engineering entirely, feeding raw clinical
+            # values for ~7 fields and literal 0.0 for the rest of the
+            # model's ~40+ expected features into every request — that's why
+            # risk scores clustered near a single constant value (~0.49)
+            # regardless of patient. Fail loud rather than silently repeating
+            # that bug if no scaler exists yet.
+            #
+            # IMPORTANT — this disk read is only a PRE-SYNC fallback value,
+            # not the final one: preprocessing.fit_scaler() unconditionally
+            # OVERWRITES config.SCALER_PATH every time an InferenceService is
+            # built (see inference_service.py), and lifespan() builds a real
+            # InferenceService right after calling this function. Without a
+            # sync step, /predict would end up using a scaler snapshot that
+            # was already stale the instant InferenceService finished — two
+            # independently-fit scalers for the same model, exactly the same
+            # class of bug Task #4 fixed for the digital twin's PCA. See
+            # lifespan(), which overwrites _scaler with InferenceService's
+            # own `.scaler` right after building it.
+            if os.path.exists(config.SCALER_PATH):
+                _scaler = joblib.load(config.SCALER_PATH)
+                logger.info(f"Loaded scaler from {config.SCALER_PATH} (pre-sync fallback)")
+            else:
+                _scaler = None
+                logger.warning(
+                    f"No scaler found at {config.SCALER_PATH} — POST /predict will "
+                    f"refuse real inference until training has produced one."
+                )
+            return
+
+    # No trained model — create demo model
+    logger.warning("No trained model found. Creating demo model.")
+    input_size = 50
+    _feature_cols = [f"feature_{i}" for i in range(input_size)]
+    _scaler = None
+    model = ICUBiLSTM(input_size=input_size)
+    model.eval()
+    _model = (model, "lstm")
+
+
+def _get_scaler():
+    """
+    Return the fitted scaler POST /predict should use to standardize
+    incoming raw vitals, the same pattern as _get_digital_twin() above.
+
+    `_scaler` (set by _load_model(), straight from config.SCALER_PATH
+    on disk) is only a pre-sync fallback value, never the authoritative
+    one. preprocessing.fit_scaler() unconditionally overwrites that one
+    shared file as a side effect of ANY call to it anywhere in the
+    process — including InferenceService's own startup fit, and even
+    an unrelated unit test fitting a scaler on a handful of raw
+    columns — so a scaler read from disk earlier can already be stale
+    or wrong-shaped by the time a request actually uses it (this is
+    exactly how the "X has 18 features, but StandardScaler is
+    expecting 7" crash was triggered while verifying the Task #4 twin
+    fix end-to-end: an earlier fit_scaler() call in the same process
+    had clobbered config.SCALER_PATH with a scaler fit on only the raw,
+    non-engineered vitals columns).
+
+    Resolving this lazily from InferenceService at request time — like
+    _get_digital_twin() already does — means /predict always uses the
+    exact scaler object InferenceService fit for the real roster
+    forward pass, regardless of whether this module's lifespan()
+    happened to run first (e.g. a TestClient(app) used without a
+    `with` block never triggers ASGI lifespan events at all, so
+    nothing that only ran inside lifespan() can be relied on here).
+    """
+    global _scaler
+    try:
+        from backend.inference_service import get_inference_service
+        svc = get_inference_service(model_type="lstm")
+        if svc.scaler is not None:
+            _scaler = svc.scaler
+    except Exception as e:
+        # No trained checkpoint / InferenceService couldn't build (e.g.
+        # the untrained demo-model fallback path in _load_model()) —
+        # fall back to whatever _load_model() already set, which may
+        # be None (POST /predict then correctly refuses with a 503).
+        logger.warning(f"_get_scaler(): could not resolve InferenceService's scaler ({e}); using fallback.")
+    return _scaler
+
+
+def _get_digital_twin():
+    """
+    Get the digital twin instance used by the LEGACY POST /predict
+    endpoint below.
+
+    Phase B fix (earlier session): this used to call
+    `generate_demo_trajectories()` on startup, seeding the twin with 10
+    entirely fabricated patient trajectories BEFORE any real prediction
+    ever happened. That fabricated seeding was removed, which fixed the
+    fabrication problem but left a narrower one: this function went on
+    to build its OWN separate `DigitalTwin` instance, so /predict's PCA
+    projection was still fit lazily on whatever z_t vectors happened to
+    pass through /predict first — non-reproducible, and degenerate
+    [0, 0] projections for the first ~10 calls after every restart (see
+    digital_twin.py's project_to_2d/_fit_pca). Meanwhile
+    inference_service.py's InferenceService already solves exactly this
+    problem for the /api/* roster endpoints via `_warm_pca()`, which
+    fits one DigitalTwin's PCA on real z_t vectors from a full,
+    deterministically-ordered (sorted by stay_id) forward pass across
+    the whole roster before any trajectory point is recorded.
+
+    Phase C fix (this change): there is no good reason for two
+    independently-fit PCA bases over the same latent space of the same
+    trained model, one reproducible and one not. So /predict now reuses
+    the SAME DigitalTwin instance InferenceService already builds and
+    pre-warms, instead of building a second one. This makes /predict's
+    2D latent projections directly comparable to the roster endpoints'
+    (identical PCA basis) and reproducible across restarts (same
+    checkpoint + same roster -> same warm-up order -> same fitted PCA),
+    rather than depending on the arrival order of real-time /predict
+    calls. lifespan() below builds the InferenceService before this is
+    first called, so in normal startup this never triggers a second,
+    redundant roster forward pass.
+    """
+    from backend.inference_service import get_inference_service
+    return get_inference_service(model_type="lstm").digital_twin
+
+
+def _generate_demo_data():
+    """Generate comprehensive demo data for the dashboard."""
+    global _demo_data
+    
+    if _demo_data is not None:
+        return _demo_data
+    
+    np.random.seed(config.SEED)
+    set_seed(config.SEED)
+    
+    twin = _get_digital_twin()
+    
+    # Generate vital signs timeline
+    n_steps = 72
+    time_labels = [f"T-{n_steps - i}" for i in range(n_steps)]
+    
+    # Simulate a deteriorating patient
+    vitals = {
+        "timestamps": time_labels,
+        "heart_rate": [],
+        "map": [],
+        "spo2": [],
+        "resp_rate": [],
+        "lactate": [],
+    }
+    
+    for t in range(n_steps):
+        severity = max(0, (t - 40) / 32) if t > 40 else 0
+        vitals["heart_rate"].append(round(78 + 35 * severity + np.random.normal(0, 3), 1))
+        vitals["map"].append(round(82 - 22 * severity + np.random.normal(0, 4), 1))
+        vitals["spo2"].append(round(97 - 4 * severity + np.random.normal(0, 1), 1))
+        vitals["resp_rate"].append(round(16 + 8 * severity + np.random.normal(0, 2), 1))
+        vitals["lactate"].append(
+            round(1.0 + 2.5 * severity + np.random.normal(0, 0.3), 2) if np.random.random() > 0.6 else None
+        )
+    
+    # Current risk score (last timestep)
+    current_risk = float(np.clip(0.15 + 0.65 * max(0, (71 - 40) / 32), 0, 1))
+    
+    # Fabricated feature importance (this whole function is the deprecated
+    # /demo path — see module docstring). Phase D: never call this "SHAP" —
+    # it's an invented list of numbers, not a computed attribution of any
+    # kind, real or approximate.
+    feature_names = [
+        "heart_rate", "MAP", "lactate", "resp_rate", "SpO2",
+        "shock_index", "HR_delta", "MAP_delta", "lactate_delta",
+        "HR_rolling_std", "temp", "WBC", "time_in_ICU",
+        "HR_missing", "lactate_time_since_obs"
+    ]
+    fabricated_importance_values = [
+        0.23, -0.19, 0.31, 0.12, -0.08,
+        0.18, 0.15, -0.14, 0.22,
+        0.09, 0.03, 0.05, 0.07,
+        -0.02, 0.06,
+    ]
+
+    feature_importance_data = [
+        {"feature": name, "importance": abs(val), "value": val, "direction": "risk" if val > 0 else "protective"}
+        for name, val in zip(feature_names, fabricated_importance_values)
+    ]
+    feature_importance_data.sort(key=lambda x: x["importance"], reverse=True)
+    
+    # Attention weights (simulated 4 heads × 72 × 72)
+    attn = np.random.dirichlet(np.ones(n_steps) * 0.5, size=(4, n_steps))
+    # Make recent timesteps get more attention
+    for h in range(4):
+        for i in range(n_steps):
+            attn[h, i, max(0, i-10):i+1] *= 3
+        attn[h] = attn[h] / attn[h].sum(axis=1, keepdims=True)
+    
+    # Subsample attention for visualization (every 4th timestep)
+    step = max(1, n_steps // 18)
+    attn_sub = attn[0, ::step, ::step]
+    attn_labels = [time_labels[i] for i in range(0, n_steps, step)]
+    
+    # Latent state trajectory (2D projection)
+    trajectory = twin.get_trajectory("patient_001")
+    if not trajectory:
+        trajectory = []
+        for t in range(50):
+            severity = max(0, (t - 25) / 25)
+            trajectory.append({
+                "t_idx": t,
+                "z_2d": [
+                    float(-2 + 3 * severity + np.random.normal(0, 0.2)),
+                    float(1 - 2 * severity + np.random.normal(0, 0.2)),
+                ],
+                "risk_score": float(np.clip(0.1 + 0.7 * severity, 0, 1)),
+            })
+    
+    # Clinical explanation
+    explanation = (
+        "Risk increased to {:.2f} (Critical) due to rising lactate (tissue hypoxia), "
+        "declining MAP (hypotension), and sustained tachycardia. "
+        "Elevated shock index indicates hemodynamic instability."
+    ).format(current_risk)
+    
+    # Patient list
+    patients = []
+    statuses = ["Stable", "Warning", "Critical", "Stable", "Warning",
+                "Stable", "Critical", "Stable", "Warning", "Stable"]
+    for i in range(10):
+        risk = np.random.uniform(0.05, 0.95)
+        patients.append({
+            "id": f"patient_{i+1:03d}",
+            "name": f"Patient {i+1:03d}",
+            "stay_id": f"S{1000 + i}",
+            "risk_score": round(float(risk), 3),
+            "status": statuses[i],
+            "hours_in_icu": round(float(np.random.uniform(4, 120)), 1),
+        })
+    
+    _demo_data = {
+        "current_patient": {
+            "id": "patient_001",
+            "risk_score": round(current_risk, 3),
+            "status": "Critical" if current_risk > 0.7 else ("Warning" if current_risk > 0.4 else "Stable"),
+            "risk_trend": "increasing",
+        },
+        "vitals": vitals,
+        "feature_importance": feature_importance_data,
+        "attention": {
+            "matrix": attn_sub.tolist(),
+            "labels": attn_labels,
+        },
+        "latent_trajectory": trajectory,
+        "explanation": explanation,
+        "patients": patients,
+    }
+    
+    return _demo_data
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FastAPI Application
+# ═══════════════════════════════════════════════════════════════════
+
+from backend.biogears_schemas import SequentialWhatIfRequest, SequentialWhatIfResponse, build_sequential_whatif_response
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Initialize models and demo data on startup.
+
+    Phase B: also builds the real InferenceService (real model + real
+    roster + real per-window predictions across the whole test split)
+    eagerly at startup, not lazily on first request. This is deliberate:
+    if the checkpoint's feature contract doesn't match the current
+    pipeline (FeatureContractError) or no trained checkpoint exists
+    (NoTrainedModelError), the API should fail loudly at startup and
+    refuse to come up — not serve broken/fabricated responses on the
+    first real request.
+
+    Phase C: InferenceService is now built BEFORE _get_digital_twin()/
+    _generate_demo_data() run, because _get_digital_twin() no longer
+    builds its own DigitalTwin — it returns InferenceService's own
+    instance, already pre-warmed with real z_t vectors from the full
+    roster (see _get_digital_twin()'s docstring). Building it first
+    means /predict's very first call, right after startup, already
+    gets the correct pre-warmed PCA basis instead of a cold one.
+
+    Phase C also fixes a second, related duplicate-state bug found
+    while verifying the twin fix end-to-end: _load_model() reads
+    config.SCALER_PATH straight off disk into `_scaler`, but
+    preprocessing.fit_scaler() (called inside InferenceService.__init__
+    via scale_splits()) unconditionally OVERWRITES that same file with
+    a freshly refit scaler every time an InferenceService is built —
+    and, worse, ANY call anywhere in the process to fit_scaler() (e.g.
+    a unit test fitting a scaler on a handful of raw columns) clobbers
+    this one shared file as a side effect. So the on-disk-loaded
+    `_scaler` can already be a stale, or even wrong-shaped, snapshot
+    by the time it's used, even though /predict and the /api/* roster
+    endpoints claim to serve the same trained model. Fixed the same
+    way as the digital twin above: POST /predict below no longer uses
+    the module-level `_scaler` global directly — it calls
+    `_get_scaler()`, which always resolves to InferenceService's own
+    fitted scaler at request time (lazily, so this is correct even if
+    something -- a test harness among them -- never runs this
+    lifespan function at all; see _get_scaler()'s docstring).
+    """
+    logger.info("Starting ICU Digital Twin API...")
+    _load_model()
+
+    from backend.inference_service import get_inference_service
+    svc = get_inference_service(model_type="lstm")
+    logger.info(
+        f"Real InferenceService ready: {len(svc.roster)} roster patients, "
+        f"checkpoint={svc.checkpoint_meta.get('checkpoint_path')}"
+    )
+
+    _get_digital_twin()
+    _generate_demo_data()
+
+    logger.info("API ready!")
+    yield
+    logger.info("Shutting down API...")
+
+
+app = FastAPI(
+    title="ICU Digital Twin API",
+    description="Real-time ICU patient risk prediction with explainability",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class PredictRequest(BaseModel):
+    """Request body for /predict endpoint."""
+    patient_data: List[Dict]  # List of timestep dicts with feature values
+    patient_id: Optional[Union[str, int]] = None
+    model_type: Optional[str] = "lstm"
+
+
+class PredictResponse(BaseModel):
+    """
+    Response from /predict endpoint.
+
+    Phase D: `gradient_attribution` (was `shap_values`) — this endpoint
+    calls explainability.gradient_x_input_attribution() directly, never
+    real SHAP, so it is never honestly labeled "shap_values". This is a
+    breaking change to this field's name; nothing in this repository
+    called it under the old name (grepped before renaming — the
+    frontend fabricates its own data independently and never called
+    this endpoint at all), so there was no live consumer to migrate.
+    """
+    risk_score: float
+    status: str
+    z_t: List[float]
+    gradient_attribution: List[Dict]
+    attention_weights: Optional[List] = None
+    explanation: str
+    latent_trajectory: Optional[List[Dict]] = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase C — explicit response models for the real /api/* endpoints.
+#
+# WHY: without these, every /api/* endpoint above just returned a raw
+# dict — FastAPI would happily serialize whatever inference_service.py
+# handed back, with no check that the shape matches what callers (soon:
+# the frontend) actually expect. Declaring `response_model=...` makes
+# FastAPI VALIDATE the real return value against this contract on every
+# request — if inference_service.py's output shape ever silently drifts
+# (a renamed field, a dict where a list was expected, a missing
+# required field), the endpoint now fails loudly with a clear
+# validation error instead of quietly serving a differently-shaped
+# payload the frontend would fail to parse in some confusing way.
+# This is schema-drift prevention, not a new source of data — every
+# field here already existed in the dicts inference_service.py returns
+# (see backend/inference_service.py), just now with an explicit,
+# checked contract.
+# ═══════════════════════════════════════════════════════════════════
+
+
+class RosterPatientOut(BaseModel):
+    stay_id: int
+    subject_id: int
+    hadm_id: int
+    age_years: Optional[float] = None
+    sex_male: Optional[bool] = None
+    n_observed_timesteps: int
+    first_charttime: str
+    last_charttime: str
+    split: str
+    latest_risk_score: Optional[float] = None
+    latest_status: Optional[str] = None
+    n_windows: int
+
+
+class RosterResponse(BaseModel):
+    patients: List[RosterPatientOut]
+    split: str
+    model_type: str
+
+
+class CurrentStatePrediction(BaseModel):
+    risk_score: float
+    status: str
+    model_type: str
+    model_epoch: Optional[int] = None
+    model_checkpoint: str
+
+
+class CurrentStateResponse(BaseModel):
+    patient: RosterPatientOut
+    observed_vitals: Dict[str, Optional[float]]
+    window_end_time: str
+    prediction: CurrentStatePrediction
+
+
+class GradientAttributionItem(BaseModel):
+    feature: str
+    importance: float
+    clinical_name: str
+
+
+class LocalGradientAttributionItem(BaseModel):
+    feature: str
+    attribution_value: float
+    direction: str
+    clinical_name: str
+
+
+class PredictionOut(BaseModel):
+    stay_id: int
+    subject_id: int
+    hadm_id: int
+    window_idx: int
+    window_start_time: str
+    window_end_time: str
+    risk_score: float
+    status: str
+    z_t: List[float]
+    z_2d: List[float]
+    gradient_attribution: List[GradientAttributionItem]
+    local_gradient_attribution: List[LocalGradientAttributionItem]
+    attention_weights: Optional[List] = None
+    explanation: str
+    explanation_method: str
+    ground_truth_label: Optional[float] = None
+    observed_vitals: Dict[str, Optional[float]]
+    model_type: str
+    model_epoch: Optional[int] = None
+    model_checkpoint: str
+
+
+class ExplanationResponse(BaseModel):
+    stay_id: int
+    window_idx: int
+    risk_score: float
+    status: str
+    gradient_attribution: List[GradientAttributionItem]
+    local_gradient_attribution: List[LocalGradientAttributionItem]
+    attention_weights: Optional[List] = None
+    explanation_text: str
+    explanation_method: str
+
+
+class TrajectoryPoint(BaseModel):
+    window_idx: int
+    window_start_time: str
+    window_end_time: str
+    risk_score: float
+    status: str
+    z_2d: List[float]
+    ground_truth_label: Optional[float] = None
+    observed_vitals: Dict[str, Optional[float]]
+
+
+class TrajectoryResponse(BaseModel):
+    stay_id: int
+    trajectory: List[TrajectoryPoint]
+
+
+class ObservedState(BaseModel):
+    """Real measured vitals for this window — ground truth data, never model output."""
+    vitals: Dict[str, Optional[float]]
+    description: str
+
+
+class PredictedLatentState(BaseModel):
+    z_t: List[float]
+    z_2d: List[float]
+    latent_dim: int
+
+
+class PredictedState(BaseModel):
+    """The trained model's real output from one forward pass on OBSERVED data above."""
+    risk_score: float
+    status: str
+    latent_state: PredictedLatentState
+    description: str
+
+
+class SimulatedState(BaseModel):
+    """Forward physiological simulation under a hypothetical intervention — not yet available."""
+    available: bool
+    description: str
+
+
+class TwinStateResponse(BaseModel):
+    stay_id: int
+    window_idx: int
+    window_end_time: str
+    observed: ObservedState
+    predicted: PredictedState
+    simulated: SimulatedState
+    disclaimer: str
+
+
+# ─── What-If / counterfactual architecture (see backend/whatif.py and
+# WHATIF_ARCHITECTURE.md) — pre-BioGears: every scenario request is
+# really validated against real patient data and a real intervenable-
+# feature vocabulary, and gets a real baseline, but the actual forward
+# physiological simulation stops at an explicit, honest boundary until
+# BioGears is connected. Nothing below fabricates a simulated result.
+
+class InterventionIn(BaseModel):
+    feature: str
+    value: float
+
+
+class WhatIfScenarioIn(BaseModel):
+    window_idx: Optional[int] = None
+    interventions: List[InterventionIn]
+    engine: str = "biogears"
+
+
+class IntervenableFeatureOut(BaseModel):
+    feature: str
+    display_name: str
+    unit: str
+    min: float
+    max: float
+    clinical_note: str
+    counterfactual_note: str
+
+
+class InterventionsListResponse(BaseModel):
+    interventions: List[IntervenableFeatureOut]
+
+
+class WhatIfBaseline(BaseModel):
+    risk_score: float
+    status: str
+    observed_vitals: Dict[str, Optional[float]]
+    description: str
+
+
+class WhatIfCounterfactual(BaseModel):
+    """The REAL ML counterfactual — the same trained model re-run on a
+    hypothetically modified input. NOT a physiological simulation."""
+    risk_score: float
+    status: str
+    risk_change: float
+    gradient_attribution: List[GradientAttributionItem]
+    explanation_method: str
+    description: str
+
+
+class WhatIfSimulation(BaseModel):
+    available: bool
+    boundary: str
+    message: str
+    description: str
+
+
+class WhatIfScenarioResult(BaseModel):
+    stay_id: int
+    window_idx: int
+    engine: str
+    requested_interventions: List[InterventionIn]
+    baseline: WhatIfBaseline
+    counterfactual: WhatIfCounterfactual
+    simulation: WhatIfSimulation
+
+
+class LegacyRosterResponse(BaseModel):
+    patients: List[RosterPatientOut]
+
+
+class LegacyPatientDetailResponse(BaseModel):
+    patient: RosterPatientOut
+    observed_vitals: Dict[str, Optional[float]]
+    prediction: CurrentStatePrediction
+    gradient_attribution: List[GradientAttributionItem]
+    explanation: str
+    explanation_method: str
+    trajectory: List[TrajectoryPoint]
+
+
+@app.get("/")
+@app.get("/health")
+async def root():
+    """Health check."""
+    return {"status": "ok", "service": "ICU Digital Twin API"}
+
+
+@app.get("/demo")
+async def get_demo_data():
+    """
+    DEPRECATED (Phase B) — fully fabricated dashboard payload.
+
+    Kept only for backward compatibility with anything still calling it
+    directly; not used by any endpoint the production/demo frontend
+    should call from Phase K onward. Use GET /api/roster and
+    GET /api/patients/{stay_id}/* instead — those are backed by real
+    model inference on real synthetic ICU stays.
+    """
+    data = _generate_demo_data()
+    return {**data, "deprecated": True, "replacement": "/api/roster, /api/patients/{stay_id}/*"}
+
+
+@app.get("/patients", response_model=LegacyRosterResponse)
+async def list_patients():
+    """
+    List real patients from the canonical roster (Phase B).
+
+    REPLACED (not just deprecated) — this used to return an independently
+    fabricated 10-patient list regenerated randomly on every process
+    start. It now returns backend/patient_roster.py's real roster: real
+    stay_id/subject_id/hadm_id from the synthetic test-split ICU stays,
+    with latest_risk_score/latest_status computed by real model
+    inference (inference_service.py). Identical to GET /api/roster;
+    kept at this path too since it's the more discoverable legacy name.
+    """
+    from backend.inference_service import get_inference_service
+    svc = get_inference_service()
+    return {"patients": svc.get_roster()}
+
+
+@app.get("/patient/{patient_id}", response_model=LegacyPatientDetailResponse)
+async def get_patient(patient_id: int):
+    """
+    Get real current state + explanation + trajectory for one patient.
+
+    REPLACED (Phase B) — `patient_id` is now a real `stay_id` from the
+    canonical roster (GET /patients or GET /api/roster), not an
+    invented string like "patient_003". All fields below come from a
+    real forward pass of the trained model on this stay's real
+    synthetic data; see backend/inference_service.py.
+    """
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+
+    svc = get_inference_service()
+    try:
+        current = svc.get_current_state(patient_id)
+        explanation = svc.get_explanation(patient_id)
+        trajectory = svc.get_trajectory(patient_id)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return {
+        "patient": current["patient"],
+        "observed_vitals": current["observed_vitals"],
+        "prediction": current["prediction"],
+        "gradient_attribution": explanation["gradient_attribution"],
+        "explanation": explanation["explanation_text"],
+        "explanation_method": explanation["explanation_method"],
+        "trajectory": trajectory,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase B — real roster-driven endpoints (backend/inference_service.py)
+# ═══════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/roster", response_model=RosterResponse)
+async def get_roster():
+    """The single canonical patient roster — real stay_ids only."""
+    from backend.inference_service import get_inference_service
+    svc = get_inference_service()
+    return {"patients": svc.get_roster(), "split": svc.split, "model_type": svc.model_type}
+
+
+@app.get("/api/patients/{stay_id}", response_model=CurrentStateResponse)
+async def get_patient_current_state(stay_id: int):
+    """Real latest observed vitals + real latest model prediction for this stay."""
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    svc = get_inference_service()
+    try:
+        return svc.get_current_state(stay_id)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/patients/{stay_id}/predict", response_model=PredictionOut)
+async def get_patient_prediction(stay_id: int, window_idx: Optional[int] = None):
+    """
+    Real model prediction for one window of this stay.
+
+    window_idx: optional; defaults to the latest available window
+    (i.e. the patient's current state). Pass an explicit window_idx to
+    inspect any earlier point in the stay (0-indexed, chronological).
+    """
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    svc = get_inference_service()
+    try:
+        return svc.get_prediction(stay_id, window_idx)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/patients/{stay_id}/explanation", response_model=ExplanationResponse)
+async def get_patient_explanation(stay_id: int, window_idx: Optional[int] = None):
+    """Real gradient-attribution explanation (global + local + NL text) for one window."""
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    svc = get_inference_service()
+    try:
+        return svc.get_explanation(stay_id, window_idx)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/patients/{stay_id}/trajectory", response_model=TrajectoryResponse)
+async def get_patient_trajectory(stay_id: int):
+    """Real per-window trajectory (observed vitals + predicted risk + z_2d) for this stay."""
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    svc = get_inference_service()
+    try:
+        return {"stay_id": stay_id, "trajectory": svc.get_trajectory(stay_id)}
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/patients/{stay_id}/twin-state", response_model=TwinStateResponse)
+async def get_patient_twin_state(stay_id: int, window_idx: Optional[int] = None):
+    """Real latent digital-twin state (z_t / z_2d) for one window of this stay."""
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    svc = get_inference_service()
+    try:
+        return svc.get_twin_state(stay_id, window_idx)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+
+# ================================================================
+# MIMIC-IV temporal model endpoints (separate from BioGears)
+# ================================================================
+
+_mimic_service = None
+
+import threading
+_mimic_service_lock = threading.Lock()
+
+
+def _get_mimic_service():
+    """Initialize the retrospective MIMIC service once and cache predictions."""
+    global _mimic_service
+
+    if _mimic_service is None:
+        with _mimic_service_lock:
+            if _mimic_service is None:
+                from backend.mimic_service import MIMICPatientService
+
+                service = MIMICPatientService()
+                service.load_data()
+                service.run_inference()
+                _mimic_service = service
+
+                logger.info(
+                    "MIMIC service ready: "
+                    f"{len(service.predictions)} assessments, "
+                    f"{service.predictions['subject_id'].nunique()} patients, "
+                    f"{service.predictions['stay_id'].nunique()} ICU stays"
+                )
+
+    return _mimic_service
+
+
+@app.get("/api/mimic/roster")
+async def get_mimic_roster():
+    """Return the held-out retrospective MIMIC-IV patient roster."""
+    try:
+        service = await run_in_threadpool(_get_mimic_service)
+        patients = await run_in_threadpool(service.get_roster)
+
+        return {
+            "source": "MIMIC-IV retrospective held-out test cohort",
+            "clinical_live_data": False,
+            "model_type": ["bilstm", "transformer"],
+            "patient_count": len({
+                patient["subject_id"] for patient in patients
+            }),
+            "icu_stay_count": len(patients),
+            "patients": patients,
+        }
+    except Exception as exc:
+        logger.error("MIMIC roster error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to load MIMIC-IV patient roster.",
+        )
+
+
+@app.get("/api/mimic/patients/{stay_id}")
+async def get_mimic_patient(stay_id: int):
+    """Return the latest available MIMIC model predictions for an ICU stay."""
+    try:
+        service = await run_in_threadpool(_get_mimic_service)
+        patient = await run_in_threadpool(service.get_patient, stay_id)
+
+        if patient is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No eligible MIMIC assessment found for stay_id {stay_id}.",
+            )
+
+        return {
+            "source": "MIMIC-IV retrospective held-out test cohort",
+            "clinical_live_data": False,
+            "patient": patient,
+            "latest_assessment": patient["assessments"][-1],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("MIMIC patient error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve MIMIC-IV patient details.",
+        )
+
+
+@app.get("/api/mimic/patients/{stay_id}/trajectory")
+async def get_mimic_patient_trajectory(stay_id: int):
+    """Return historical BiLSTM and Transformer risk predictions for a stay."""
+    try:
+        service = await run_in_threadpool(_get_mimic_service)
+        patient = await run_in_threadpool(service.get_patient, stay_id)
+
+        if patient is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No eligible MIMIC assessment found for stay_id {stay_id}.",
+            )
+
+        return {
+            "source": "MIMIC-IV retrospective held-out test cohort",
+            "clinical_live_data": False,
+            "stay_id": stay_id,
+            "trajectory": patient["assessments"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("MIMIC trajectory error: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve MIMIC-IV patient trajectory.",
+        )
+
+
+@app.get("/api/whatif/interventions", response_model=InterventionsListResponse)
+async def list_whatif_interventions():
+    """
+    Real, single source of truth for what a What-If scenario can ask
+    about — see backend/whatif.py's INTERVENABLE_FEATURES. The
+    frontend fetches this rather than hardcoding a second copy.
+    """
+    from backend.whatif import list_intervenable_features
+    return {"interventions": list_intervenable_features()}
+
+
+@app.post("/api/patients/{stay_id}/whatif", response_model=WhatIfScenarioResult)
+async def run_whatif_scenario(stay_id: int, scenario: WhatIfScenarioIn):
+    """
+    Pre-BioGears What-If / true ML counterfactual endpoint (see
+    backend/whatif.py and docs/BIOGEARS_INTEGRATION_BOUNDARY.md).
+    Validates the request against real patient data and the real
+    intervenable-feature vocabulary, computes a REAL ML counterfactual
+    (the same trained model re-run on the modified input through the
+    real feature-engineering pipeline — see
+    InferenceService.compute_counterfactual), and returns a result that
+    stops at the honest BioGears integration boundary for the
+    physiological-simulation portion — never a fabricated simulated
+    outcome.
+    """
+    from backend.inference_service import get_inference_service, UnknownStayIdError
+    from backend.whatif import validate_scenario_request, run_scenario, InterventionValidationError
+
+    svc = get_inference_service()
+    known_stay_ids = {p["stay_id"] for p in svc.get_roster()}
+
+    try:
+        request = validate_scenario_request(
+            stay_id=stay_id,
+            window_idx=scenario.window_idx,
+            interventions=[i.model_dump() for i in scenario.interventions],
+            engine=scenario.engine,
+            known_stay_ids=known_stay_ids,
+        )
+    except InterventionValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        baseline_prediction = svc.get_prediction(stay_id, scenario.window_idx)
+    except UnknownStayIdError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    from backend.inference_service import ModelOutputCorrectnessError
+    try:
+        return run_scenario(baseline_prediction, request, svc)
+    except ModelOutputCorrectnessError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/predict")
+async def predict(request: PredictRequest):
+    """
+    Predict risk from patient time-series data.
+    
+    Input: List of timestep dictionaries with feature values
+    Output: Risk score, latent state, real gradient×input attribution
+    (never SHAP — see explainability.py's module docstring), and explanation.
+    """
+    global _model, _feature_cols
+
+    if _model is None:
+        _load_model()
+
+    model, model_type = _model
+    device = next(model.parameters()).device
+
+    # See _get_scaler()'s docstring: resolves lazily to InferenceService's
+    # own fitted scaler rather than trusting the module-level `_scaler`
+    # global directly, which can be stale or wrong-shaped.
+    scaler = _get_scaler()
+    if scaler is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "No fitted scaler available (config.SCALER_PATH is missing). "
+                "POST /predict cannot run real inference without it — train a "
+                "model first (python -m backend.train), which fits and saves "
+                "the scaler as a side effect. Refusing to silently fall back "
+                "to unscaled input, which previously caused near-constant, "
+                "uninformative risk scores for every patient."
+            ),
+        )
+
+    if not request.patient_data:
+        raise HTTPException(status_code=422, detail="patient_data must be a non-empty list of timestep records.")
+
+    try:
+        # Build a properly scaled, feature-engineered input tensor using the
+        # SAME pipeline training used (resample -> missingness indicators ->
+        # feature engineering on raw clinical values -> scaling with the
+        # trained scaler -> exact feature_cols ordering -> windowing). See
+        # preprocessing.prepare_inference_sequence's docstring. This replaces
+        # a previous ad-hoc loop that fed raw, unscaled vitals for only the
+        # ~7 fields the frontend sends and left the model's other ~40
+        # expected features at literal 0.0 for every request — the root
+        # cause of risk scores clustering near one constant value regardless
+        # of patient (see known-issues-checklist.md).
+        from backend.preprocessing import prepare_inference_sequence
+
+        X_tensor, mask, _engineered_df = prepare_inference_sequence(
+            request.patient_data, scaler, _feature_cols, window_size=config.INPUT_WINDOW
+        )
+        X_tensor = X_tensor.to(device)
+        mask = mask.to(device)
+
+        # Forward pass
+        model.eval()
+        with torch.no_grad():
+            if model_type == "transformer":
+                risk, z_t, attn = model(X_tensor, mask)
+                attn_list = [a.cpu().numpy().tolist() for a in attn]
+            else:
+                risk, z_t = model(X_tensor, mask)
+                attn_list = None
+        
+        risk_score = float(risk.squeeze().cpu().item())
+        z_t_list = z_t.squeeze().cpu().numpy().tolist()
+        
+        # Status
+        if risk_score >= 0.7:
+            status = "Critical"
+        elif risk_score >= 0.4:
+            status = "Warning"
+        else:
+            status = "Stable"
+        
+        # Update digital twin
+        twin = _get_digital_twin()
+        patient_id = request.patient_id or "realtime_patient"
+        twin_result = twin.extract_trajectory(
+            model, X_tensor, mask, patient_id, model_type
+        )
+        
+        # Generate explanation — real gradient×input attribution, never SHAP
+        # (see explainability.py's Phase D docstring; this endpoint has never
+        # called real SHAP, only ever this approximation).
+        from backend.explainability import generate_clinical_explanation, gradient_x_input_attribution
+
+        attribution_vals = gradient_x_input_attribution(model, X_tensor, mask, model_type, device)
+
+        from backend.explainability import compute_global_importance
+        global_imp = compute_global_importance(attribution_vals, _feature_cols, top_k=10)
+
+        explanation = generate_clinical_explanation(
+            attribution_vals, _feature_cols, risk_score, sample_idx=0
+        )
+
+        return PredictResponse(
+            risk_score=risk_score,
+            status=status,
+            z_t=z_t_list,
+            gradient_attribution=global_imp,
+            attention_weights=attn_list,
+            explanation=explanation,
+            latent_trajectory=twin.get_trajectory(patient_id),
+        )
+        
+    except Exception as e:
+        logger.error(f"Prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# Phase 3 - Real BioGears Physiology & Inference Integration
+# ============================================================
+
+@app.post("/biogears/predict")
+@app.post("/api/biogears/predict")
+async def predict_biogears(request: Optional[dict] = None):
+    """
+    Run real ICUBiLSTM inference on a standardized 6-hour BioGears
+    simulation output, returning raw risk and 256-D latent state.
+    """
+    try:
+        from backend.biogears_adapter import BioGearsFeatureTransformer
+        from backend.biogears_inference import (
+            prepare_biogears_input,
+            run_lstm_inference,
+            run_lstm_trajectory,
+            load_biogears_csv,
+        )
+
+        request = request or {}
+
+        if not os.path.exists(config.BIOGEARS_LSTM_MODEL_PATH):
+            raise HTTPException(
+        status_code=503,
+        detail="BioGears LSTM model not found at models/biogears_lstm_model.pt.",
+    )
+
+        checkpoint = torch.load(
+    config.BIOGEARS_LSTM_MODEL_PATH,
+    map_location="cpu",
+    weights_only=False,
+)
+        feature_cols = checkpoint["feature_cols"]
+
+        biogears_csv = request.get(
+            "csv_path",
+            os.path.join(
+                config.PROJECT_ROOT,
+                "biogears_runs",
+                "stable_6hour_results.csvResults.csv",
+            ),
+        )
+
+        if not os.path.exists(biogears_csv):
+            raise HTTPException(
+                status_code=404,
+                detail=f"BioGears results file not found: {biogears_csv}",
+            )
+
+        patient_id = request.get("patient_id", "biogears_patient_001")
+        lab_mode = request.get("lab_mode", "calibrated_prior")
+
+        # Prepare the exact 72 x 46 input expected by the trained LSTM.
+        X, mask, df = prepare_biogears_input(
+            input_path=biogears_csv,
+            feature_cols=feature_cols,
+            patient_id=patient_id,
+            lab_mode=lab_mode,
+        )
+
+        # Run the real trained model.
+        result = run_lstm_inference(X, mask=mask)
+
+        # Extract the learned latent state at each timestep.
+        trajectory_result = run_lstm_trajectory(X, mask=mask)
+        latent_trajectory = trajectory_result["latent_trajectory"]
+
+        # Project latent states to 2D PCA space
+        all_z = [np.array(pt["latent_state"], dtype=np.float32) for pt in latent_trajectory]
+        if len(all_z) >= 2:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=2)
+            pca_coords = pca.fit_transform(np.array(all_z))
+            for idx, pt in enumerate(latent_trajectory):
+                pt["z_2d"] = [float(pca_coords[idx, 0]), float(pca_coords[idx, 1])]
+        else:
+            for pt in latent_trajectory:
+                pt["z_2d"] = [0.0, 0.0]
+
+        raw_df = load_biogears_csv(biogears_csv, patient_id=patient_id, lab_mode=lab_mode)
+        latest_raw = raw_df.iloc[-1]
+
+        timeline = (
+            raw_df.set_index("charttime")[
+                ["heart_rate", "map", "resp_rate", "spo2", "temp"]
+            ]
+            .resample("5min")
+            .mean()
+            .ffill()
+            .tail(72)
+            .reset_index()
+        )
+
+        vitals_timeline = {
+            "timestamps": [str(t) for t in timeline["charttime"]],
+            "heart_rate": [float(v) for v in timeline["heart_rate"]],
+            "map": [float(v) for v in timeline["map"]],
+            "resp_rate": [float(v) for v in timeline["resp_rate"]],
+            "spo2": [float(v) for v in timeline["spo2"]],
+            "temp": [float(v) for v in timeline["temp"]],
+        }
+
+        return {
+            "source": "BioGears",
+            "simulation_file": os.path.basename(biogears_csv),
+            "patient_id": patient_id,
+            "risk_probability": result["risk_probability"],
+            "risk_percentage": result["risk_percentage"],
+            "risk_class": result["risk_class"],
+            "input_shape": result["input_shape"],
+            "timesteps": int(X.shape[0]),
+            "features": int(X.shape[1]),
+            "latent_state": result["latent_state"],
+            "latent_dimension": result["latent_dimension"],
+            "latent_trajectory": latent_trajectory,
+            "latest_vitals": {
+                "heart_rate": float(latest_raw["heart_rate"]),
+                "map": float(latest_raw["map"]),
+                "resp_rate": float(latest_raw["resp_rate"]),
+                "spo2": float(latest_raw["spo2"]),
+                "temp": float(latest_raw["temp"]),
+            },
+            "vitals_timeline": vitals_timeline,
+            "simulation_time_seconds": float(latest_raw["time_seconds"]),
+            "charttime": str(latest_raw["charttime"]),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"BioGears prediction error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/biogears/intervene")
+@app.post("/api/biogears/intervene")
+async def intervene_biogears(request: Optional[dict] = None):
+    """
+    Run a real BioGears intervention scenario and compare
+    baseline vs post-intervention LSTM predictions.
+    """
+    try:
+        from backend.biogears_intervention import run_biogears_intervention
+
+        request = request or {}
+        intervention = str(request.get("intervention", "saline")).lower()
+        patient_id = str(request.get("patient_id", "biogears_intervention_patient"))
+
+        result = run_biogears_intervention(
+            intervention=intervention,
+            patient_id=patient_id,
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"BioGears intervention error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/biogears/simulate")
+async def submit_simulation(request: Optional[dict] = None):
+    """
+    Submit an asynchronous simulation job to the background ThreadPoolExecutor.
+    Returns immediately with HTTP 200 and the job_id for polling.
+    """
+    try:
+        from backend.biogears_service import job_manager
+
+        request = request or {}
+        patient_id = str(request.get("patient_id", "biogears_patient_001"))
+        scenario_type = str(request.get("scenario_type", "baseline"))
+        lab_mode = str(request.get("lab_mode", "calibrated_prior"))
+
+        csv_path = request.get(
+            "csv_path",
+            os.path.join(
+                config.PROJECT_ROOT,
+                "biogears_runs",
+                "stable_6hour_results.csvResults.csv",
+            ),
+        )
+
+        if not os.path.exists(csv_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Simulation source file not found: {csv_path}",
+            )
+
+        job_id = await job_manager.submit_simulation_job(
+            csv_path=csv_path,
+            patient_id=patient_id,
+            scenario_type=scenario_type,
+            lab_mode=lab_mode,
+        )
+
+        return {
+            "job_id": job_id,
+            "status": "queued",
+            "message": "BioGears simulation job submitted successfully.",
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Async simulation submission error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/biogears/jobs/{job_id}")
+async def get_simulation_job(job_id: str):
+    """Poll status and retrieve result payload for a background BioGears job."""
+    from backend.biogears_service import job_manager
+
+    job = job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"BioGears job '{job_id}' not found.",
+        )
+    return job.to_dict()
+
+
+@app.get("/api/v1/biogears/jobs")
+async def list_simulation_jobs():
+    """List recent BioGears background execution jobs."""
+    from backend.biogears_service import job_manager
+    return {"jobs": job_manager.list_jobs()}
+
+
+
+
+# ─── BioGears Sequential What-If & Mixed Intervention Endpoints ─────────────
+
+@app.post(
+    "/biogears/whatif/sequential",
+    summary="Sequential BioGears Saline What-If Simulation",
+)
+async def post_biogears_whatif_sequential(request: SequentialWhatIfRequest):
+    """
+    Execute a sequential saline intervention scenario on a continuous BioGears timeline
+    or return verified cached results if an identical scenario has been previously simulated.
+    """
+    from backend.biogears_scenario_builder import (
+        BioGearsSalineBolus,
+        BioGearsNorepinephrineInfusion,
+        BioGearsSequentialScenario,
+        BioGearsScenarioBuilderError,
+    )
+    from backend.biogears_sequential_execution import (
+        execute_sequential_saline_scenario,
+        execute_sequential_scenario,
+        BioGearsExtractionError,
+    )
+    from backend.biogears_bridge import (
+        BioGearsTimeoutError,
+        BioGearsProcessError,
+        BioGearsNotFoundError,
+        BioGearsOutputNotFoundError,
+        BioGearsOutputParseError,
+    )
+    from backend.biogears_schemas import build_sequential_whatif_response
+
+    req = request
+
+    # 1. Deterministic default scenario name if omitted
+    if req.scenario_name and req.scenario_name.strip():
+        scenario_name = req.scenario_name.strip()
+    else:
+        parts = []
+        for a in req.actions:
+            if a.type == "saline":
+                rate_val = getattr(a, "rate_ml_per_min", 50.0)
+                rate_tag = f"@{int(rate_val)}mLmin" if rate_val != 50.0 else ""
+                parts.append(f"{int(a.volume_ml)}mL{rate_tag}")
+            else:
+                rate_val = getattr(a, "rate_ml_per_min", 1.0)
+                dur_val = getattr(a, "duration_s", 120.0)
+                conc_val = getattr(a, "concentration_ug_ml", 14.0)
+                parts.append(f"NE_{int(conc_val)}ug@{rate_val}mLmin_{int(dur_val)}s")
+        summary_str = "_".join(parts)
+        scenario_name = f"SeqIntervention_{len(req.actions)}actions_{summary_str}"
+
+    # 3. Map request actions to domain objects
+    try:
+        domain_actions = []
+        for act in req.actions:
+            if act.type == "saline":
+                domain_actions.append(
+                    BioGearsSalineBolus(
+                        bag_volume_ml=act.volume_ml,
+                        rate_ml_per_min=getattr(act, "rate_ml_per_min", 50.0),
+                        start_time_s=act.start_time_s,
+                    )
+                )
+            elif act.type == "norepinephrine":
+                domain_actions.append(
+                    BioGearsNorepinephrineInfusion(
+                        start_time_s=act.start_time_s,
+                        concentration_ug_ml=act.concentration_ug_ml,
+                        rate_ml_per_min=act.rate_ml_per_min,
+                        duration_s=act.duration_s,
+                    )
+                )
+            else:
+                raise BioGearsScenarioBuilderError(f"Unsupported action type '{act.type}'.")
+
+        scenario = BioGearsSequentialScenario(
+            scenario_name=scenario_name,
+            patient_file=req.patient_file,
+            samples_per_second=req.samples_per_second,
+            baseline_stabilization_s=req.baseline_stabilization_s,
+            post_observation_s=req.post_observation_s,
+            actions=domain_actions,
+        )
+        scenario.validate()
+    except (BioGearsScenarioBuilderError, ValueError) as err:
+        logger.warning(f"Scenario validation rejected: {err}")
+        raise HTTPException(status_code=422, detail=str(err))
+
+    # 4. Execute scenario through sequential pipeline with caching and concurrency locking
+    try:
+        if all(isinstance(a, BioGearsSalineBolus) for a in domain_actions):
+            exec_result = await run_in_threadpool(
+                execute_sequential_saline_scenario, scenario=scenario, use_cache=True
+            )
+        else:
+            exec_result = await run_in_threadpool(
+                execute_sequential_scenario, scenario=scenario, use_cache=True
+            )
+    except BioGearsScenarioBuilderError as err:
+        logger.warning(f"Scenario builder error during execution: {err}")
+        raise HTTPException(status_code=422, detail=str(err))
+    except BioGearsTimeoutError as err:
+        logger.error(f"BioGears execution timed out: {err}")
+        raise HTTPException(
+            status_code=504,
+            detail=f"BioGears simulation timed out after {err.timeout_seconds}s.",
+        )
+    except BioGearsNotFoundError as err:
+        logger.error(f"BioGears executable not found: {err}")
+        raise HTTPException(
+            status_code=503,
+            detail="BioGears engine executable not found on host system.",
+        )
+    except BioGearsProcessError as err:
+        logger.error(f"BioGears process error: exit code {err.returncode}. {err.stderr or err.stdout}")
+        raise HTTPException(
+            status_code=503,
+            detail="BioGears simulation engine returned a non-zero exit code.",
+        )
+    except BioGearsOutputNotFoundError as err:
+        logger.error(f"BioGears output missing: {err}")
+        raise HTTPException(
+            status_code=503,
+            detail="BioGears simulation completed but output CSV was not generated.",
+        )
+    except BioGearsOutputParseError as err:
+        logger.error(f"BioGears output parse error: {err}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to parse BioGears simulation output.",
+        )
+    except BioGearsExtractionError as err:
+        logger.error(f"Physiological extraction error: {err}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to extract physiological snapshots from simulation output.",
+        )
+    except Exception as err:
+        logger.error(f"Unexpected internal failure during scenario execution: {err}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error occurred during sequential scenario execution.",
+        )
+
+    # 5. Build and return structured response
+    response_model = build_sequential_whatif_response(exec_result)
+    return response_model.model_dump()
+
+
+@app.get("/biogears/intervention")
+@app.get("/intervention/simulate")
+async def get_biogears_intervention():
+    """
+    Return baseline vs post-intervention physiological state and model prediction
+    using the verified BioGears 100 mL saline experiment (StandardMale.xml).
+    """
+    from backend.biogears_intervention import compare_verified_saline_experiment
+    try:
+        return compare_verified_saline_experiment()
+    except Exception as e:
+        logger.error(f"Error evaluating BioGears intervention: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "backend.api:app",
+        host=config.API_HOST,
+        port=config.API_PORT,
+        reload=True,
+    )
+
