@@ -408,7 +408,7 @@ export default function App() {
               : 'Stored Cohort Predictions'}
           </span>
           <span className="hidden lg:inline text-slate-500">
-            â€¢ Dynamic ML executes on-demand inference; does not assert higher clinical accuracy over cohort baseline.
+            {"\u2022"} Dynamic ML executes on-demand inference; does not assert higher clinical accuracy over cohort baseline.
           </span>
         </div>
       </div>
@@ -528,7 +528,7 @@ export default function App() {
           {/* Footer */}
           <div className="mt-4 pb-4 text-center">
             <p className="text-[10px] text-slate-700">
-              ICU Digital Twin System v1.0 â€¢ MIMIC-IV Compatible â€¢ Research Use Only
+              ICU Digital Twin System v1.0 {"\u2022"} MIMIC-IV Compatible {"\u2022"} Research Use Only
             </p>
           </div>
         </main>
