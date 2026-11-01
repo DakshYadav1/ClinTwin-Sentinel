@@ -458,7 +458,12 @@ No raw MIMIC-IV patient data or MIMIC-trained model checkpoints are distributed 
 
 **Project:** ClinTwin Sentinel — ICU Digital Twin Research Prototype
 
-**GitHub:** [DakshYadav1/ClinTwin-Sentinel](https://github.com/DakshYadav1/ClinTwin-Sentinel)
+**Project Team:**
+- Daksh Yadav
+- Diya Prakash
+- Erin Joseph
+- Manjunath Byadagi
 
-**Core technologies:** BioGears, MIMIC-IV, BiLSTM, Transformer, FastAPI, React, PyTorch.
+**GitHub Repository:** [DakshYadav1/ClinTwin-Sentinel](https://github.com/DakshYadav1/ClinTwin-Sentinel)
 
+**Core Technologies:** BioGears, MIMIC-IV, BiLSTM, Transformer, FastAPI, React, PyTorch.
