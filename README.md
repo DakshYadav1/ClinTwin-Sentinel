@@ -1,158 +1,464 @@
-# ClinTwin Sentinel — ICU Digital Twin Dashboard
+# ClinTwin Sentinel
+### ICU Digital Twin Research Prototype | BioGears + MIMIC-IV + Deep Learning
 
-Real-time ICU patient risk prediction with explainability, built with FastAPI + React/Vite.
+ClinTwin Sentinel is an ICU Digital Twin research prototype that combines physiological simulation, retrospective ICU data analysis, and temporal deep-learning models to estimate patient deterioration risk.
 
-For the full, verified, step-by-step sequence from a clean environment — including training the model, running the full test suite, and walking the complete demo flow — see **`docs/RUN_EVERYTHING.md`**. This README's Quick Start below is the short version.
+The system integrates two independent pathways:
+
+- **BioGears:** Physiology-based simulation, machine-learning inference, and What-If intervention analysis.
+- **MIMIC-IV:** Retrospective ICU data processing and independent BiLSTM and Transformer deterioration prediction.
+
+The application uses a FastAPI backend and React dashboard to visualize model outputs and patient trajectories.
+
+> **Research prototype only.** ClinTwin Sentinel is not a medical device and must not be used for diagnosis, treatment decisions, or real-time clinical care.
 
 ---
 
-## Quick Start
+## 1. Key Features
 
-### 1 — Install backend dependencies
+### BioGears Physiological Simulation
+- Physiological data generation using BioGears.
+- Five-minute resampling and 46-feature engineering.
+- Temporal sequence modelling using BiLSTM.
+- Deterioration-risk estimation and 256-dimensional latent-state representation.
+- FastAPI integration and interactive React visualization.
+
+### What-If Intervention Simulation
+- Simulates hypothetical physiological interventions.
+- Demonstrates a 100 mL saline bolus scenario.
+- Supports visualization and comparison of simulated physiological responses.
+- Provides a framework for exploring intervention scenarios.
+
+### MIMIC-IV Retrospective Analysis
+- Processes retrospective ICU data from MIMIC-IV v3.1.
+- Extracts vital signs, laboratory measurements, urine output, and vasopressor information.
+- Engineers hourly physiological and SOFA-related features.
+- Constructs six-hour temporal sequences.
+- Predicts deterioration using two independent deep-learning models.
+
+### Machine Learning Models
+
+| Model | Architecture | Purpose |
+|---|---|---|
+| BioGears BiLSTM | Bidirectional LSTM | Temporal physiological modelling |
+| MIMIC-IV BiLSTM | Two-layer BiLSTM | Retrospective deterioration prediction |
+| MIMIC-IV Transformer | Transformer Encoder | Attention-based temporal prediction |
+
+### Dashboard
+- Separate BioGears and MIMIC-IV source modes.
+- Patient and ICU stay selection.
+- Deterioration-risk visualization.
+- Independent model predictions.
+- Prediction trajectory visualization.
+- Vitals and feature attribution panels.
+- Latent-state and attention visualizations.
+- What-If simulation interface.
+
+---
+
+## 2. System Architecture
+
+### BioGears Pipeline
+
+```text
+BioGears Simulation
+        |
+Physiological CSV
+        |
+5-Minute Resampling
+        |
+46 Feature Engineering
+        |
+72 x 46 Input Tensor
+        |
+BioGears BiLSTM
+        |
+Risk Score + 256-D Latent State
+        |
+FastAPI Backend
+        |
+React Dashboard / What-If
+```
+
+### MIMIC-IV Pipeline
+
+```text
+MIMIC-IV v3.1
+      |
+Data Extraction and Cleaning
+      |
+Hourly Feature Engineering
+      |
+SOFA Calculation and Labelling
+      |
+Patient-Level Train / Validation / Test Split
+      |
+Six-Hour Sequence Construction
+      |
+BiLSTM             Transformer
+    |                    |
+    +---------+----------+
+              |
+      Independent Predictions
+              |
+         FastAPI
+              |
+       React Dashboard
+```
+
+The two pathways operate independently and use separate inference workflows.
+
+---
+
+## 3. Technology Stack
+
+| Layer | Technologies |
+|---|---|
+| Programming | Python, JavaScript |
+| Backend | FastAPI, Uvicorn |
+| Frontend | React 18, Vite, Tailwind CSS |
+| Machine Learning | PyTorch, BiLSTM, Transformer |
+| Data Processing | Pandas, NumPy, Scikit-learn |
+| Visualization | Recharts, Framer Motion |
+| Physiological Simulation | BioGears |
+| Dataset | MIMIC-IV v3.1 |
+| Version Control | Git, GitHub |
+
+---
+
+## 4. Repository Structure
+
+```text
+ClinTwin-Sentinel/
+│
+├── backend/
+│   ├── api.py
+│   ├── mimic_inference.py
+│   ├── mimic_service.py
+│   ├── inference_service.py
+│   ├── biogears_service.py
+│   ├── biogears_inference.py
+│   ├── lstm_model.py
+│   ├── transformer_model.py
+│   ├── mimic_adapter/
+│   └── synthetic_data/
+│
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── services/
+│   │   └── App.jsx
+│   ├── package.json
+│   └── package-lock.json
+│
+├── models/
+│   ├── biogears_lstm_model.pt
+│   ├── biogears_transformer_model.pt
+│   └── biogears_scaler.joblib
+│
+├── scripts/
+│   └── mimic/
+│
+├── data/
+│   └── real/
+│
+├── docs/
+│   ├── BIOGEARS_IMPLEMENTATION.md
+│   ├── MIMIC_IV_SETUP.md
+│   ├── RUN_EVERYTHING.md
+│   └── SYNTHETIC_DATA.md
+│
+├── experiments/
+├── tests/
+├── config.py
+├── generate_synthetic_data.py
+├── DATA_CONTRACT.md
+└── README.md
+```
+
+---
+
+## 5. Prerequisites
+
+Install the following software before starting:
+
+| Software | Purpose |
+|---|---|
+| Git | Repository cloning |
+| Python | Backend and ML execution |
+| Node.js and npm | Frontend execution |
+| VS Code | Recommended development environment |
+| BioGears | Physiological simulation pathway |
+
+Use a Python version compatible with the dependencies in `backend/requirements.txt`.
+
+---
+
+## 6. Installation and Setup
+
+### Step 1: Clone the repository
 
 ```bash
-cd C:\Users\diyap\Documents\projects\clinTwinSentinel\project
+git clone https://github.com/DakshYadav1/ClinTwin-Sentinel.git
+```
+
+Navigate into the project:
+
+```bash
+cd ClinTwin-Sentinel
+```
+
+### Step 2: Set up the Python environment
+
+Create a virtual environment:
+
+**Windows PowerShell**
+
+```powershell
+python -m venv venv
+```
+
+Activate it:
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+**Linux / macOS**
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### Step 3: Install backend dependencies
+
+From the project root:
+
+```bash
 pip install -r backend/requirements.txt
 ```
 
-### 2 — Start the FastAPI backend
+### Step 4: Install frontend dependencies
+
+Open another terminal:
 
 ```bash
-cd C:\Users\diyap\Documents\projects\clinTwinSentinel\project
-python -m uvicorn backend.api:app --reload --port 8000
+cd frontend
+npm install
 ```
 
-The API will be available at **http://localhost:8000**  
-Interactive docs: http://localhost:8000/docs
+---
 
-### 3 — Start the React frontend (separate terminal)
+## 7. Running the Application
+
+The backend and frontend must run simultaneously in separate terminals.
+
+### Terminal 1: Start FastAPI Backend
+
+From the project root, with the virtual environment activated:
 
 ```bash
-cd C:\Users\diyap\Documents\projects\clinTwinSentinel\project\frontend
-npm install
+uvicorn backend.api:app --reload --host 127.0.0.1 --port 8000
+```
+
+Backend:
+
+```text
+http://127.0.0.1:8000
+```
+
+API documentation:
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+### Terminal 2: Start React Frontend
+
+From the frontend directory:
+
+```bash
 npm run dev
 ```
 
-The dashboard will be available at **http://localhost:5173**
+Vite normally starts the application at:
+
+```text
+http://localhost:5173
+```
+
+Open this address in your browser to access the ClinTwin Sentinel dashboard.
 
 ---
 
-## API Endpoints
+## 8. MIMIC-IV Setup
 
-The table below is a legacy subset kept for quick reference — it predates several real endpoints this project now has (the `/api/*` roster-driven endpoints, the BioGears/What-If endpoints). See `backend/api.py`'s own module docstring for the complete, current, authoritative endpoint list — it's actively maintained there, not here, so it won't drift out of date the way this table has before.
+**Important:** MIMIC-IV is not distributed with this repository.
 
-| Method | Endpoint          | Description                                   |
-|--------|-------------------|-----------------------------------------------|
-| GET    | `/` / `/health`   | Health check                                  |
-| GET    | `/api/roster`     | Real canonical patient roster (primary)       |
-| GET    | `/api/patients/{stay_id}` | Real current state for one patient     |
-| GET    | `/api/patients/{stay_id}/predict` | Real model prediction           |
-| POST   | `/predict`        | Run model inference on custom time-series     |
-| GET    | `/patients`, `/patient/{id}` | Legacy aliases, same real data as `/api/*` above |
-| GET    | `/demo`           | **Deprecated** — fabricated demo snapshot, kept only for backward compatibility |
+Users must independently obtain authorized access to MIMIC-IV and comply with its data-use requirements.
 
-### `/patient/{id}` Response Shape
+### Required local files
 
-```json
-{
-  "patient": {
-    "id": "patient_001",
-    "name": "Patient 001",
-    "risk_score": 0.86,
-    "status": "Critical",
-    "hours_in_icu": 18.4,
-    "risk_trend": "increasing"
-  },
-  "vitals": {
-    "timestamps": ["T-72", ...],
-    "heart_rate": [78.2, ...],
-    "map": [82.1, ...],
-    "spo2": [97.0, ...],
-    "resp_rate": [16.3, ...],
-    "lactate": [null, 1.2, ...]
-  },
-  "shap": [
-    { "feature": "lactate", "value": 0.31, "importance": 0.31, "direction": "risk" },
-    ...
-  ],
-  "attention": {
-    "matrix": [[...], ...],
-    "labels": ["T-72", ...]
-  },
-  "latent_trajectory": [
-    { "t_idx": 0, "z_2d": [-1.8, 0.9], "risk_score": 0.02 },
-    ...
-  ],
-  "explanation": "Risk increased to 0.86 (Critical) due to ..."
-}
+The MIMIC-IV workflow expects the processed dataset and trained checkpoints locally.
+
+Expected paths include:
+
+```text
+data/
+└── real/
+    ├── raw/
+    │   └── mimiciv-3.1/
+    │
+    └── processed/
+        └── splits/
+            └── mimic_test.csv
+
+models/
+└── mimic/
+    ├── mimic_bilstm.pt
+    └── mimic_transformer.pt
 ```
+
+These files are intentionally excluded from GitHub.
+
+### Reproducing the pipeline
+
+The repository includes scripts under:
+
+```text
+scripts/mimic/
+```
+
+They cover:
+
+1. ICU cohort construction.
+2. Laboratory and vital-sign extraction and cleaning.
+3. SOFA feature engineering.
+4. Vasopressor feature engineering.
+5. Deterioration label generation.
+6. Patient-level dataset splitting.
+7. Six-hour sequence construction.
+8. Temporal model training.
+9. Model evaluation.
+
+Refer to:
+
+- `docs/MIMIC_IV_SETUP.md`
+- `DATA_CONTRACT.md`
+
+The MIMIC dashboard requires the processed test dataset and both trained checkpoints to be generated locally before it can return predictions.
+
+### MIMIC-IV API endpoints
+
+| Endpoint | Description |
+|---|---|
+| `GET /api/mimic/roster` | Retrieves retrospective ICU cohort |
+| `GET /api/mimic/patients/{stay_id}` | Retrieves selected ICU stay and predictions |
+| `GET /api/mimic/patients/{stay_id}/trajectory` | Retrieves prediction trajectory |
+
+The MIMIC-IV pathway is retrospective and does not process live clinical data.
 
 ---
 
-## Frontend → Backend Connection
+## 9. BioGears Setup
 
-- **Patient list**: `GET /patients` → sidebar
-- **Patient selection**: `GET /patient/{id}` → all six panels
-- **Demo fallback**: If the backend is unreachable, locally generated data is used and a yellow banner is displayed
+The BioGears pathway requires a compatible BioGears installation and the appropriate local simulation configuration.
+
+The repository includes BioGears model artifacts:
+
+```text
+models/
+├── biogears_lstm_model.pt
+├── biogears_transformer_model.pt
+└── biogears_scaler.joblib
+```
+
+Additional legacy model artifacts or configuration files may be required by the existing backend startup and inference workflow. These are not all distributed with the repository.
+
+Follow the setup and architecture documentation:
+
+- `docs/BIOGEARS_IMPLEMENTATION.md`
+- `docs/BIOGEARS_INTEGRATION_BOUNDARY.md`
+- `WHATIF_ARCHITECTURE.md`
 
 ---
 
-## Training (required — checkpoints are gitignored, not shipped)
+## 10. Model Evaluation
 
-`models/lstm_model.pt`, `transformer_model.pt`, and `scaler.joblib` are **not** committed to this repo (gitignored) and must be trained locally before the backend can serve real predictions — a fresh clone does not have working models until you run this.
+The MIMIC-IV temporal models were evaluated on a held-out patient-level test set.
 
-```bash
-# BiLSTM — the primary, reported model (train this one)
-python -m backend.train --model lstm
+| Metric | BiLSTM | Transformer |
+|---|---:|---:|
+| AUROC | 0.6567 | 0.7186 |
+| AUPRC | 0.2834 | 0.3224 |
+| Precision | 0.2611 | 0.2495 |
+| Recall | 0.4224 | 0.7519 |
+| F1-score | 0.3227 | 0.3747 |
 
-# Transformer — kept only as an optional ablation comparison, not a
-# second production model (short 6-timestep input window means
-# self-attention's main advantage doesn't apply here — see
-# backend/train.py's module docstring for the full reasoning)
-python -m backend.train --model transformer
+The Transformer achieved higher recall and AUROC in this evaluation, while both models demonstrated limitations, including false positives.
 
-# Train on synthetic data (no real CSV needed)
-python -m backend.train --model lstm --demo
-
-# Evaluate a trained model, including the required baseline comparison
-python -m backend.evaluate --model lstm --with-baselines
-```
+These are retrospective research results and do not establish clinical effectiveness.
 
 ---
 
-## Project Structure
+## 11. Important Research Limitations
 
-This is illustrative, not exhaustive — the frontend in particular grows with active feature work (e.g. the BioGears What-If/Scenario Comparison components), so treat `frontend/src/` and `backend/` directory listings as the source of truth over this diagram.
+- MIMIC-IV is retrospective, not a live clinical data source.
+- Hourly SOFA-related features are research proxies; conventional SOFA scoring generally uses the worst values over a 24-hour period.
+- Missing physiological measurements and incomplete SOFA component coverage affect the available cohort.
+- Prediction probabilities are not clinical diagnoses.
+- Both models require further external validation and clinical evaluation.
+- What-If interventions are simulated scenarios, not treatment recommendations.
 
-```
-project/
-├── backend/
-│   ├── api.py               # FastAPI application
-│   ├── train.py             # Training pipeline (BiLSTM primary; Transformer = optional ablation only)
-│   ├── evaluate.py          # Evaluation metrics (incl. required baseline comparison, --with-baselines)
-│   ├── baselines.py         # Required logistic-regression + XGBoost baselines
-│   ├── lstm_model.py        # BiLSTM architecture (primary)
-│   ├── transformer_model.py # Transformer architecture (ablation-only, not production)
-│   ├── preprocessing.py     # Data preprocessing
-│   ├── feature_engineering.py
-│   ├── labels_sofa.py       # Real label generation (SOFA/Sepsis-3) — the one actually used
-│   ├── labels.py            # Deprecated ad-hoc rule — NOT used for training/evaluation, kept for history only
-│   ├── dataset.py           # PyTorch DataLoader
-│   ├── digital_twin.py      # Latent state management
-│   ├── explainability.py    # Gradient-attribution explanations (not real SHAP — see module docstring)
-│   ├── whatif.py            # ML counterfactual (same trained model, modified input)
-│   ├── biogears_*.py        # Real BioGears physiological simulation integration
-│   └── requirements.txt
-├── frontend/
-│   └── src/
-│       ├── App.jsx
-│       ├── hooks/
-│       │   └── usePatientData.js  # Real API client + graceful demo-mode fallback
-│       └── components/            # see frontend/src/components/ for the current full list
-├── models/                  # gitignored — train locally, see "Training" below
-│   ├── lstm_model.pt
-│   ├── transformer_model.pt
-│   └── scaler.joblib
-├── config.py
-└── utils.py
-```
+**ClinTwin Sentinel is intended exclusively for research, education, and software prototyping.**
+
+---
+
+## 12. Troubleshooting
+
+| Issue | Suggested action |
+|---|---|
+| Python package installation fails | Check Python compatibility and `backend/requirements.txt` |
+| `uvicorn` not found | Activate the virtual environment and install backend requirements |
+| Frontend dependencies missing | Run `npm install` inside `frontend/` |
+| Frontend cannot reach backend | Verify that FastAPI is running on port 8000 |
+| MIMIC roster fails to load | Verify the processed test dataset exists |
+| MIMIC model loading fails | Verify both checkpoints exist under `models/mimic/` |
+| BioGears simulation fails | Verify BioGears installation and scenario configuration |
+| Model checkpoint missing | Generate or provide the required local model artifacts |
+
+---
+
+## 13. Documentation
+
+Additional project documentation is available in the `docs/` directory.
+
+- `DATA_CONTRACT.md` — Dataset and feature contract.
+- `PRE_BIOGEARS_ARCHITECTURE.md` — Earlier system architecture.
+- `WHATIF_ARCHITECTURE.md` — What-If simulation architecture.
+- `docs/MIMIC_IV_SETUP.md` — MIMIC-IV setup.
+- `docs/BIOGEARS_IMPLEMENTATION.md` — BioGears implementation.
+- `docs/RUN_EVERYTHING.md` — Project execution guidance.
+
+---
+
+## 14. License and Data Usage
+
+MIMIC-IV access is subject to the dataset's own access requirements and data-use agreement. Users must obtain authorization independently.
+
+BioGears and other third-party components remain subject to their respective licenses and terms.
+
+No raw MIMIC-IV patient data or MIMIC-trained model checkpoints are distributed in this repository.
+
+---
+
+## 15. Authors and Project
+
+**Project:** ClinTwin Sentinel — ICU Digital Twin Research Prototype
+
+**GitHub:** [DakshYadav1/ClinTwin-Sentinel](https://github.com/DakshYadav1/ClinTwin-Sentinel)
+
+**Core technologies:** BioGears, MIMIC-IV, BiLSTM, Transformer, FastAPI, React, PyTorch.
+
