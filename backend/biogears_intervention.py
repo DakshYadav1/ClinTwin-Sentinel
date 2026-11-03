@@ -33,7 +33,7 @@ logger = logging.getLogger("icu_digital_twin")
 
 ROOT = Path(config.PROJECT_ROOT)
 RUN_DIR = ROOT / "biogears_runs"
-BASE_RESULTS = RUN_DIR / "stable_6hour_results.csvResults.csv"
+BASE_RESULTS = RUN_DIR / "baseline_resultsResults.csv"
 
 INTERVENTIONS = {
     "saline": {
@@ -49,10 +49,11 @@ INTERVENTIONS = {
 def _run_lstm_on_csv(csv_path: Path, patient_id: str = "biogears_patient") -> Dict[str, Any]:
     """Execute feature transformer and BiLSTM inference on simulation CSV."""
     checkpoint = torch.load(
-        config.LSTM_MODEL_PATH,
-        map_location="cpu",
-        weights_only=False,
+    config.BIOGEARS_LSTM_MODEL_PATH,
+    map_location="cpu",
+    weights_only=False,
     )
+
     feature_cols = checkpoint["feature_cols"]
 
     transformer = BioGearsFeatureTransformer(feature_cols=feature_cols)
@@ -141,7 +142,7 @@ def run_biogears_intervention(
     if after_csv is None or not Path(after_csv).exists():
         # Verified fallback reference output
         reference_after = RUN_DIR / "stable_6hour_saline_interventionResults.csv"
-        verified_tmp = Path(r"C:\BioGears\bin\Scenarios\tmp\bg_demo_100ml_salineResults.csv")
+        verified_tmp = Path(r"C:\Program Files\BioGears\bin\Scenarios\tmp\bg_demo_100ml_salineResults.csv")
         if reference_after.exists():
             after_csv = reference_after
         elif verified_tmp.exists():
@@ -189,7 +190,7 @@ def compare_verified_saline_experiment(
     """
     if csv_path is None:
         cand_paths = [
-            Path(r"C:\BioGears\bin\Scenarios\tmp\bg_demo_100ml_salineResults.csv"),
+            Path(r"C:\Program Files\BioGears\bin\Scenarios\tmp\bg_demo_100ml_salineResults.csv"),
             Path(config.PROJECT_ROOT) / "biogears_runs" / "stable_6hour_saline_interventionResults.csv",
         ]
         for p in cand_paths:

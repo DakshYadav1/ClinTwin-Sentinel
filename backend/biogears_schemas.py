@@ -3,7 +3,8 @@ biogears_schemas.py — Request & Response Schemas for Sequential BioGears What-
 ==================================================================================================
 Pydantic v2 schemas and trajectory serialization helpers for the sequential BioGears What-If API.
 """
-
+from pathlib import Path
+import logging
 from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, Field, field_validator
 
@@ -34,6 +35,8 @@ from backend.biogears_sequential_execution import (
     PhysiologicalSnapshot,
     SequentialExecutionResult,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Request Schemas ──────────────────────────────────────────────────────────
@@ -297,6 +300,13 @@ class SequentialWhatIfResponse(BaseModel):
     trajectory: TrajectoryResponse
     provenance_disclaimer: str
 
+    # Optional model-estimated intervention risk comparison
+    baseline_risk_score: Optional[float] = None
+    after_intervention_risk_score: Optional[float] = None
+    risk_change: Optional[float] = None
+    risk_change_direction: Optional[str] = None
+    risk_class_after_intervention: Optional[str] = None
+
 
 # ─── Serialization Helpers ───────────────────────────────────────────────────
 
@@ -428,7 +438,63 @@ def build_sequential_whatif_response(
         )
 
     trajectory = build_trajectory_response(result.biogears_result)
+        # Calculate baseline and post-intervention risk using the same BiLSTM model
+    baseline_risk = None
+    after_risk = None
+    risk_change = None
+    risk_direction = None
+    risk_class_after = None
 
+    try:
+        from backend.biogears_intervention import (
+            BASE_RESULTS,
+            _run_lstm_on_csv,
+        )
+
+        # 1. Calculate baseline risk
+        if BASE_RESULTS.exists():
+            baseline_prediction = _run_lstm_on_csv(
+                BASE_RESULTS,
+                patient_id="biogears_baseline_patient",
+            )
+
+            baseline_risk = round(
+                baseline_prediction["risk_percentage"], 2
+            )
+        else:
+            logger.warning(
+                "Baseline BioGears CSV not found: %s",
+                BASE_RESULTS,
+            )
+
+        # 2. Calculate post-intervention risk
+        if result.output_csv_path and Path(result.output_csv_path).exists():
+            after_prediction = _run_lstm_on_csv(
+                Path(result.output_csv_path),
+                patient_id="biogears_sequential_patient",
+            )
+
+            after_risk = round(
+                after_prediction["risk_percentage"], 2
+            )
+
+            risk_class_after = after_prediction["risk_class"]
+
+        # 3. Calculate risk difference
+        if baseline_risk is not None and after_risk is not None:
+            risk_change = round(after_risk - baseline_risk, 2)
+
+            if risk_change > 0:
+                risk_direction = "INCREASED"
+            elif risk_change < 0:
+                risk_direction = "DECREASED"
+            else:
+                risk_direction = "UNCHANGED"
+
+    except Exception:
+        logger.exception(
+            "Could not calculate BioGears intervention risk comparison"
+        )
     disclaimer = (
         f"Mechanistic physiological simulation executed via BioGears engine using virtual subject "
         f"'{result.scenario.patient_file}'. Outputs reflect verified mathematical physiology models "
@@ -436,10 +502,17 @@ def build_sequential_whatif_response(
     )
 
     return SequentialWhatIfResponse(
-        metadata=metadata,
-        baseline_snapshot=baseline_snap,
-        intermediate_milestones=intermediate_milestones,
-        final_snapshot=final_snap,
-        trajectory=trajectory,
-        provenance_disclaimer=disclaimer,
-    )
+    metadata=metadata,
+    baseline_snapshot=baseline_snap,
+    intermediate_milestones=intermediate_milestones,
+    final_snapshot=final_snap,
+    trajectory=trajectory,
+    provenance_disclaimer=disclaimer,
+
+    # BiLSTM intervention risk output
+    baseline_risk_score=baseline_risk,
+    after_intervention_risk_score=after_risk,
+    risk_change=risk_change,
+    risk_change_direction=risk_direction,
+    risk_class_after_intervention=risk_class_after,
+)

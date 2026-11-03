@@ -126,14 +126,25 @@ export default function VitalsTimeline({ vitals }) {
   if (!vitals?.timestamps) return null;
 
   // Transform data for Recharts
-  const chartData = vitals.timestamps.map((t, i) => ({
-    time: t,
+  // Display relative ICU days instead of de-identified calendar years.
+const firstTimestamp = new Date(vitals.timestamps[0]).getTime();
+
+const chartData = vitals.timestamps.map((t, i) => {
+  const currentTimestamp = new Date(t).getTime();
+  const elapsedHours = Math.max(
+    0,
+    (currentTimestamp - firstTimestamp) / (1000 * 60 * 60)
+  );
+
+  return {
+    time: `Day ${Math.floor(elapsedHours / 24) + 1}`,
     heart_rate: vitals.heart_rate?.[i],
     map: vitals.map?.[i],
     spo2: vitals.spo2?.[i],
     resp_rate: vitals.resp_rate?.[i],
     lactate: vitals.lactate?.[i],
-  }));
+  };
+});
 
   return (
     <motion.div

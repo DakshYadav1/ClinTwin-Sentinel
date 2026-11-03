@@ -277,6 +277,7 @@ export default function WhatIfTrajectoryChart({
                     <ReferenceLine
                       key={`${marker.id}_start`}
                       x={marker.startTime}
+                      yAxisId="hr"
                       stroke={marker.style.startStroke}
                       strokeDasharray="4 4"
                       strokeWidth={1.5}
@@ -292,6 +293,7 @@ export default function WhatIfTrajectoryChart({
                     <ReferenceLine
                       key={`${marker.id}_end`}
                       x={marker.endTime}
+                      yAxisId="hr"
                       stroke={marker.style.endStroke}
                       strokeDasharray="4 4"
                       strokeWidth={1.5}
@@ -400,6 +402,7 @@ export default function WhatIfTrajectoryChart({
                     <ReferenceLine
                       key={`${marker.id}_start`}
                       x={marker.startTime}
+                      yAxisId="bv"
                       stroke={marker.style.startStroke}
                       strokeDasharray="4 4"
                       strokeWidth={1.5}
@@ -415,6 +418,7 @@ export default function WhatIfTrajectoryChart({
                     <ReferenceLine
                       key={`${marker.id}_end`}
                       x={marker.endTime}
+                      yAxisId="bv"
                       stroke={marker.style.endStroke}
                       strokeDasharray="4 4"
                       strokeWidth={1.5}

@@ -251,9 +251,9 @@ class BioGearsConfig:
           the main Scenarios\\Patient\\ browser view; created automatically
     """
 
-    executable: str = r"C:\BioGears\bin\bg-scenario.exe"
+    executable: str = r"C:\Program Files\BioGears\bin\bg-scenario.exe"
     timeout_seconds: int = 300
-    tmp_dir: str = r"C:\BioGears\bin\Scenarios\tmp"
+    tmp_dir: str = r"biogears_runs\tmp"
 
 
 # ─── Bridge class ─────────────────────────────────────────────────────────────

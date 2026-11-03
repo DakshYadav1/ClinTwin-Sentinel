@@ -110,7 +110,7 @@ def resolve_patient_file(
             return p_path
 
     # Standard BioGears installation directory
-    default_bg_patient = Path(r"C:\BioGears\bin\patients") / patient_file
+    default_bg_patient = Path(r"C:\Program Files\BioGears\bin\patients") / patient_file
     if default_bg_patient.is_file():
         return default_bg_patient
 
