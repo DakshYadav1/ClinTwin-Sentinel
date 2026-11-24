@@ -60,14 +60,19 @@ function PatientSidebar({ patients, selectedId, onSelect }) {
                 className="w-2 h-2 rounded-full flex-shrink-0"
                 style={{ backgroundColor: statusColor, boxShadow: `0 0 6px ${statusColor}` }}
               />
+              
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-medium text-slate-300 truncate">
+                <p
+                  className="text-xs font-medium text-slate-300 whitespace-normal break-all leading-tight"
+                  title={patientName}
+                >
                   {patientName}
                 </p>
-                <p className="text-[10px] text-slate-500">
+                <p className="text-[10px] text-slate-500 mt-1">
                   {hours.toFixed(0)}h {"\u2022"} Risk: {(riskScore * 100).toFixed(1)}%
                 </p>
               </div>
+
               <div
                 className={`status-badge text-[9px] px-2 py-0.5 status-${status.toLowerCase()} whitespace-nowrap`}
               >
@@ -455,9 +460,9 @@ export default function App() {
         <AnimatePresence>
           {sidebarOpen && (
             <motion.aside
-              className="w-56 flex-shrink-0 p-3 pr-0"
+              className="w-64 flex-shrink-0 p-3 pr-0"
               initial={{ width: 0, opacity: 0 }}
-              animate={{ width: 224, opacity: 1 }}
+              animate={{ width: 256, opacity: 1 }}
               exit={{ width: 0, opacity: 0 }}
               transition={{ duration: 0.3 }}
             >
